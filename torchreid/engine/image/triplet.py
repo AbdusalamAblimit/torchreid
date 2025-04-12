@@ -120,3 +120,268 @@ class ImageTripletEngine(Engine):
         self.optimizer.step()
 
         return loss_summary
+
+
+
+
+import time
+
+import os.path as osp
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+# 假设以下模块已正确导入
+# from torchreid.losses import TripletLoss, CrossEntropyLoss
+# import torchreid.metrics as metrics
+from torchreid.utils import (
+     AverageMeter, re_ranking,
+    visualize_ranked_results
+)
+
+
+
+
+class ImageTripletEnginePose(Engine):
+    r"""Engine for training with the new fusion network that takes both image and heatmap as input.
+
+    主要改动：
+      - parse_data_for_train: 除了 'img' 和 'pid'，还提取 'heatmap'
+      - forward_backward: 调用模型时传入图像和热图，并根据返回的融合特征计算 Triplet loss 及（可选的）交叉熵损失
+      - parse_data_for_eval 和 _evaluate: 测试时也使用图像和热图提取特征
+    """
+    def __init__(
+        self,
+        datamanager,
+        model,
+        optimizer,
+        margin=0.3,
+        weight_t=1,
+        weight_x=1,
+        scheduler=None,
+        use_gpu=True,
+        label_smooth=True
+    ):
+        super(ImageTripletEnginePose, self).__init__(datamanager, use_gpu)
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.register_model('model', model, optimizer, scheduler)
+
+        assert weight_t >= 0 and weight_x >= 0
+        assert weight_t + weight_x > 0
+        self.weight_t = weight_t
+        self.weight_x = weight_x
+
+        self.criterion_t = TripletLoss(margin=margin)
+        self.criterion_x = CrossEntropyLoss(
+            num_classes=self.datamanager.num_train_pids,
+            use_gpu=self.use_gpu,
+            label_smooth=label_smooth
+        )
+
+    def parse_data_for_train(self, data):
+        """提取训练数据中的图像、标签和热图"""
+        imgs = data['img']
+        pids = data['pid']
+        heatmaps = data['heatmap']
+        return imgs, pids, heatmaps
+
+    def forward_backward(self, data):
+        # 提取图像、pid 和热图
+        imgs, pids, heatmaps = self.parse_data_for_train(data)
+        if self.use_gpu:
+            imgs = imgs.cuda()
+            pids = pids.cuda()
+            heatmaps = heatmaps.float().cuda()
+
+        # 模型前向传播，传入图像和热图，返回融合后的特征向量，尺寸 (B,1024)
+        x_global,x_local,golbal_logits,local_logits = self.model(imgs, heatmaps)
+
+        loss = 0
+        loss_summary = {}
+
+        # Triplet loss 部分
+        if self.weight_t > 0:
+            loss_t_local = self.compute_loss(self.criterion_t, x_local, pids)
+            loss += self.weight_t * loss_t_local
+            loss_summary['loss_t_local'] = loss_t_local.item()
+
+            loss_t_global = self.compute_loss(self.criterion_t, x_global, pids)
+            loss += self.weight_t * loss_t_global
+            loss_summary['loss_t_globall'] = loss_t_global.item()
+
+        # Cross-entropy loss 部分（如果模型定义了分类器则调用，否则直接用融合特征）
+        if self.weight_x > 0:
+            loss_x_global = self.compute_loss(self.criterion_x, golbal_logits, pids)
+            loss += self.weight_x * loss_x_global
+            loss_summary['loss_x_global'] = loss_x_global.item()
+            loss_summary['acc_global'] = metrics.accuracy(golbal_logits, pids)[0].item()
+
+            loss_x_local = self.compute_loss(self.criterion_x, local_logits, pids)
+            loss += self.weight_x * loss_x_local
+            loss_summary['loss_x_local'] = loss_x_local.item()
+            loss_summary['acc_local'] = metrics.accuracy(local_logits, pids)[0].item()
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return loss_summary
+
+    def parse_data_for_eval(self, data):
+        """提取测试数据中的图像、pid、camid 和热图"""
+        imgs = data['img']
+        pids = data['pid']
+        camids = data['camid']
+        heatmaps = data['heatmap']
+        return imgs, pids, camids, heatmaps
+    @torch.no_grad()
+    def _evaluate(
+        self,
+        dataset_name='',
+        query_loader=None,
+        gallery_loader=None,
+        dist_metric='euclidean',
+        normalize_feature=False,
+        visrank=False,
+        visrank_topk=10,
+        save_dir='',
+        use_metric_cuhk03=False,
+        ranks=[1, 5, 10, 20],
+        rerank=False
+    ):
+        self.set_model_mode('eval')
+        batch_time = AverageMeter()
+
+        def _feature_extraction(data_loader):
+            global_features, local_features, concat_features = [], [], []
+            pids_, camids_ = [], []
+            for batch_idx, data in enumerate(data_loader):
+                imgs, pids, camids, heatmaps = self.parse_data_for_eval(data)
+                if self.use_gpu:
+                    imgs = imgs.cuda()
+                    heatmaps = heatmaps.float().cuda()
+                end = time.time()
+                # 模型前向传播同时传入图像和热图
+                # 假设模型返回四个输出： x_global, x_local
+                x_global, x_local= self.model(imgs, heatmaps)
+                batch_time.update(time.time() - end)
+                # 计算拼接后的特征，并 L2 归一化
+                concat_feat = torch.cat([x_global, x_local], dim=1)
+                concat_feat = F.normalize(concat_feat, p=2, dim=1)
+                global_features.append(x_global.cpu())
+                local_features.append(x_local.cpu())
+                concat_features.append(concat_feat.cpu())
+                pids_.extend(pids.tolist())
+                camids_.extend(camids.tolist())
+            global_features = torch.cat(global_features, 0)
+            local_features = torch.cat(local_features, 0)
+            concat_features = torch.cat(concat_features, 0)
+            pids_ = np.asarray(pids_)
+            camids_ = np.asarray(camids_)
+            return global_features, local_features, concat_features, pids_, camids_
+
+        print('Extracting features from query set ...')
+        q_global, q_local, q_concat, q_pids, q_camids = _feature_extraction(query_loader)
+        print('Done, obtained {}-by-{} matrix'.format(q_concat.size(0), q_concat.size(1)))
+
+        print('Extracting features from gallery set ...')
+        g_global, g_local, g_concat, g_pids, g_camids = _feature_extraction(gallery_loader)
+        print('Done, obtained {}-by-{} matrix'.format(g_concat.size(0), g_concat.size(1)))
+        print('Speed: {:.4f} sec/batch'.format(batch_time.avg))
+
+        if normalize_feature:
+            print('Normalizing features with L2 norm ...')
+            q_global = F.normalize(q_global, p=2, dim=1)
+            q_local = F.normalize(q_local, p=2, dim=1)
+            q_concat = F.normalize(q_concat, p=2, dim=1)
+            g_global = F.normalize(g_global, p=2, dim=1)
+            g_local = F.normalize(g_local, p=2, dim=1)
+            g_concat = F.normalize(g_concat, p=2, dim=1)
+
+        def evaluate_features(qf, gf, name):
+            print('Computing distance matrix for {} features with metric={} ...'.format(name, dist_metric))
+            distmat = metrics.compute_distance_matrix(qf, gf, dist_metric)
+            if rerank:
+                print('Applying person re-ranking ...')
+                distmat_qq = metrics.compute_distance_matrix(qf, qf, dist_metric)
+                distmat_gg = metrics.compute_distance_matrix(gf, gf, dist_metric)
+                distmat = re_ranking(distmat, distmat_qq, distmat_gg)
+            print('Computing CMC and mAP for {} features ...'.format(name))
+            cmc, mAP = metrics.evaluate_rank(distmat, q_pids, g_pids, q_camids, g_camids, use_metric_cuhk03=use_metric_cuhk03)
+            print('** {} Results **'.format(name))
+            print('mAP: {:.1%}'.format(mAP))
+            print('CMC curve')
+            for r in ranks:
+                print('Rank-{:<3}: {:.1%}'.format(r, cmc[r - 1]))
+            return cmc[0], mAP
+
+        # 分别评估全局特征、局部特征和拼接后的融合特征
+        print('Evaluating global features ...')
+        rank1_global, mAP_global = evaluate_features(q_global, g_global, 'Global')
+
+        print('Evaluating local features ...')
+        rank1_local, mAP_local = evaluate_features(q_local, g_local, 'Local')
+
+        print('Evaluating concatenated features ...')
+        rank1_concat, mAP_concat = evaluate_features(q_concat, g_concat, 'Fusion')
+
+        return {
+            'global': {'rank1': rank1_global, 'mAP': mAP_global},
+            'local': {'rank1': rank1_local, 'mAP': mAP_local},
+            'fusion': {'rank1': rank1_concat, 'mAP': mAP_concat}
+        }
+    
+    def test(
+        self,
+        dist_metric='euclidean',
+        normalize_feature=False,
+        visrank=False,
+        visrank_topk=10,
+        save_dir='',
+        use_metric_cuhk03=False,
+        ranks=[1, 5, 10, 20],
+        rerank=False
+    ):
+        r"""Tests model on target datasets.
+
+        This version extracts features using the fusion network,
+        and evaluates three types of features: global, local and fusion (global + local).
+        """
+        self.set_model_mode('eval')
+        targets = list(self.test_loader.keys())
+        results = {}
+
+        for name in targets:
+            domain = 'source' if name in self.datamanager.sources else 'target'
+            print('##### Evaluating {} ({}) #####'.format(name, domain))
+            query_loader = self.test_loader[name]['query']
+            gallery_loader = self.test_loader[name]['gallery']
+
+            # _evaluate 返回一个字典，包含 'global', 'local' 和 'fusion' 三种特征的评估结果
+            metrics_dict = self._evaluate(
+                dataset_name=name,
+                query_loader=query_loader,
+                gallery_loader=gallery_loader,
+                dist_metric=dist_metric,
+                normalize_feature=normalize_feature,
+                visrank=visrank,
+                visrank_topk=visrank_topk,
+                save_dir=save_dir,
+                use_metric_cuhk03=use_metric_cuhk03,
+                ranks=ranks,
+                rerank=rerank
+            )
+            print("Results for {}:".format(name))
+            for key, vals in metrics_dict.items():
+                print("  {} features: Rank-1: {:.1%}, mAP: {:.1%}".format(key, vals['rank1'], vals['mAP']))
+            results[name] = metrics_dict
+
+            if self.writer is not None:
+                for key, vals in metrics_dict.items():
+                    self.writer.add_scalar(f'Test/{name}/{key}_rank1', vals['rank1'], self.epoch)
+                    self.writer.add_scalar(f'Test/{name}/{key}_mAP', vals['mAP'], self.epoch)
+
+        return results

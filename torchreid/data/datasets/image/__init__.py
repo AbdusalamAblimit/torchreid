@@ -13,3 +13,4 @@ from .sensereid import SenseReID
 from .market1501 import Market1501
 from .dukemtmcreid import DukeMTMCreID
 from .university1652 import University1652
+from .market1501pose import Market1501Pose

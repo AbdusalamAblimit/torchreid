@@ -21,7 +21,7 @@ from .resnet_ibn_a import *
 from .resnet_ibn_b import *
 from .shufflenetv2 import *
 from .inceptionresnetv2 import *
-
+from .osnet_ain import osnetmod_ain_x1_0
 __model_factory = {
     # image classification models
     'resnet18': resnet18,
@@ -74,7 +74,8 @@ __model_factory = {
     'osnet_ain_x1_0': osnet_ain_x1_0,
     'osnet_ain_x0_75': osnet_ain_x0_75,
     'osnet_ain_x0_5': osnet_ain_x0_5,
-    'osnet_ain_x0_25': osnet_ain_x0_25
+    'osnet_ain_x0_25': osnet_ain_x0_25,
+    'osnetmod_ain_x1_0': osnetmod_ain_x1_0,
 }
 
 

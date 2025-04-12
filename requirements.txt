@@ -4,7 +4,7 @@ h5py
 Pillow
 six
 scipy
-opencv-python
+opencv-python-headless
 matplotlib
 tb-nightly
 future
