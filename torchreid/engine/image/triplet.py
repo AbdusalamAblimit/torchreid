@@ -143,13 +143,26 @@ from torchreid.utils import (
 
 
 
+
+import time
+import os.path as osp
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from torchreid import metrics
+from torchreid.losses import TripletLoss, CrossEntropyLoss
+from torchreid.utils import AverageMeter, re_ranking, visualize_ranked_results
+from ..engine import Engine
+
+
 class ImageTripletEnginePose(Engine):
     r"""Engine for training with the new fusion network that takes both image and heatmap as input.
-
+    
     主要改动：
       - parse_data_for_train: 除了 'img' 和 'pid'，还提取 'heatmap'
-      - forward_backward: 调用模型时传入图像和热图，并根据返回的融合特征计算 Triplet loss 及（可选的）交叉熵损失
-      - parse_data_for_eval 和 _evaluate: 测试时也使用图像和热图提取特征
+      - forward_backward: 调用模型时传入图像和热图，并将返回的局部特征列表拼接后计算 Triplet loss 以及交叉熵损失
+      - parse_data_for_eval 和 _evaluate: 测试时同样将局部特征列表拼接后计算融合特征
     """
     def __init__(
         self,
@@ -196,33 +209,40 @@ class ImageTripletEnginePose(Engine):
             pids = pids.cuda()
             heatmaps = heatmaps.float().cuda()
 
-        # 模型前向传播，传入图像和热图，返回融合后的特征向量，尺寸 (B,1024)
-        x_global,x_local,golbal_logits,local_logits = self.model(imgs, heatmaps)
+        # 模型前向传播，传入图像和热图，返回：
+        #   x_global: 全局特征 (B, feature_dim)
+        #   x_local: 局部特征列表，每个元素形状 (B, feature_dim)，共17个
+        #   global_logits, local_logits: 对应分类器输出，用于交叉熵损失
+        x_global, x_local, global_logits, local_logits = self.model(imgs, heatmaps)
+        # 将17个局部特征拼接为 (B, 17 * feature_dim)
+        x_local_concat = torch.cat(x_local, dim=1)
 
         loss = 0
         loss_summary = {}
 
         # Triplet loss 部分
         if self.weight_t > 0:
-            loss_t_local = self.compute_loss(self.criterion_t, x_local, pids)
+            loss_t_local = self.compute_loss(self.criterion_t, x_local_concat, pids)
             loss += self.weight_t * loss_t_local
             loss_summary['loss_t_local'] = loss_t_local.item()
 
             loss_t_global = self.compute_loss(self.criterion_t, x_global, pids)
             loss += self.weight_t * loss_t_global
-            loss_summary['loss_t_globall'] = loss_t_global.item()
+            loss_summary['loss_t_global'] = loss_t_global.item()
 
-        # Cross-entropy loss 部分（如果模型定义了分类器则调用，否则直接用融合特征）
+        # Cross-entropy loss 部分
         if self.weight_x > 0:
-            loss_x_global = self.compute_loss(self.criterion_x, golbal_logits, pids)
+            loss_x_global = self.compute_loss(self.criterion_x, global_logits, pids)
             loss += self.weight_x * loss_x_global
             loss_summary['loss_x_global'] = loss_x_global.item()
-            loss_summary['acc_global'] = metrics.accuracy(golbal_logits, pids)[0].item()
+            loss_summary['acc_global'] = metrics.accuracy(global_logits, pids)[0].item()
 
             loss_x_local = self.compute_loss(self.criterion_x, local_logits, pids)
             loss += self.weight_x * loss_x_local
             loss_summary['loss_x_local'] = loss_x_local.item()
             loss_summary['acc_local'] = metrics.accuracy(local_logits, pids)[0].item()
+
+        assert loss_summary
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -237,6 +257,7 @@ class ImageTripletEnginePose(Engine):
         camids = data['camid']
         heatmaps = data['heatmap']
         return imgs, pids, camids, heatmaps
+
     @torch.no_grad()
     def _evaluate(
         self,
@@ -256,7 +277,7 @@ class ImageTripletEnginePose(Engine):
         batch_time = AverageMeter()
 
         def _feature_extraction(data_loader):
-            global_features, local_features, concat_features = [], [], []
+            global_features, local_features, fusion_features = [], [], []
             pids_, camids_ = [], []
             for batch_idx, data in enumerate(data_loader):
                 imgs, pids, camids, heatmaps = self.parse_data_for_eval(data)
@@ -264,42 +285,45 @@ class ImageTripletEnginePose(Engine):
                     imgs = imgs.cuda()
                     heatmaps = heatmaps.float().cuda()
                 end = time.time()
-                # 模型前向传播同时传入图像和热图
-                # 假设模型返回四个输出： x_global, x_local
-                x_global, x_local= self.model(imgs, heatmaps)
+                # 测试时模型只返回全局特征和局部特征列表
+                x_global, x_local = self.model(imgs, heatmaps)
                 batch_time.update(time.time() - end)
-                # 计算拼接后的特征，并 L2 归一化
-                concat_feat = torch.cat([x_global, x_local], dim=1)
-                concat_feat = F.normalize(concat_feat, p=2, dim=1)
+                # 将局部特征列表拼接为一个张量
+                x_local_concat = torch.cat(x_local, dim=1)
+                # 融合特征为全局与局部拼接后并归一化
+                fusion_feat = torch.cat([x_global, x_local_concat], dim=1)
+                fusion_feat = F.normalize(fusion_feat, p=2, dim=1)
+                
                 global_features.append(x_global.cpu())
-                local_features.append(x_local.cpu())
-                concat_features.append(concat_feat.cpu())
+                local_features.append(x_local_concat.cpu())
+                fusion_features.append(fusion_feat.cpu())
+
                 pids_.extend(pids.tolist())
                 camids_.extend(camids.tolist())
             global_features = torch.cat(global_features, 0)
             local_features = torch.cat(local_features, 0)
-            concat_features = torch.cat(concat_features, 0)
+            fusion_features = torch.cat(fusion_features, 0)
             pids_ = np.asarray(pids_)
             camids_ = np.asarray(camids_)
-            return global_features, local_features, concat_features, pids_, camids_
+            return global_features, local_features, fusion_features, pids_, camids_
 
         print('Extracting features from query set ...')
-        q_global, q_local, q_concat, q_pids, q_camids = _feature_extraction(query_loader)
-        print('Done, obtained {}-by-{} matrix'.format(q_concat.size(0), q_concat.size(1)))
+        q_global, q_local, q_fusion, q_pids, q_camids = _feature_extraction(query_loader)
+        print('Done, obtained {}-by-{} matrix'.format(q_fusion.size(0), q_fusion.size(1)))
 
         print('Extracting features from gallery set ...')
-        g_global, g_local, g_concat, g_pids, g_camids = _feature_extraction(gallery_loader)
-        print('Done, obtained {}-by-{} matrix'.format(g_concat.size(0), g_concat.size(1)))
+        g_global, g_local, g_fusion, g_pids, g_camids = _feature_extraction(gallery_loader)
+        print('Done, obtained {}-by-{} matrix'.format(g_fusion.size(0), g_fusion.size(1)))
         print('Speed: {:.4f} sec/batch'.format(batch_time.avg))
 
         if normalize_feature:
             print('Normalizing features with L2 norm ...')
             q_global = F.normalize(q_global, p=2, dim=1)
             q_local = F.normalize(q_local, p=2, dim=1)
-            q_concat = F.normalize(q_concat, p=2, dim=1)
+            q_fusion = F.normalize(q_fusion, p=2, dim=1)
             g_global = F.normalize(g_global, p=2, dim=1)
             g_local = F.normalize(g_local, p=2, dim=1)
-            g_concat = F.normalize(g_concat, p=2, dim=1)
+            g_fusion = F.normalize(g_fusion, p=2, dim=1)
 
         def evaluate_features(qf, gf, name):
             print('Computing distance matrix for {} features with metric={} ...'.format(name, dist_metric))
@@ -326,12 +350,12 @@ class ImageTripletEnginePose(Engine):
         rank1_local, mAP_local = evaluate_features(q_local, g_local, 'Local')
 
         print('Evaluating concatenated features ...')
-        rank1_concat, mAP_concat = evaluate_features(q_concat, g_concat, 'Fusion')
+        rank1_fusion, mAP_fusion = evaluate_features(q_fusion, g_fusion, 'Fusion')
 
         return {
             'global': {'rank1': rank1_global, 'mAP': mAP_global},
             'local': {'rank1': rank1_local, 'mAP': mAP_local},
-            'fusion': {'rank1': rank1_concat, 'mAP': mAP_concat}
+            'fusion': {'rank1': rank1_fusion, 'mAP': mAP_fusion}
         }
     
     def test(
@@ -347,8 +371,7 @@ class ImageTripletEnginePose(Engine):
     ):
         r"""Tests model on target datasets.
 
-        This version extracts features using the fusion network,
-        and evaluates three types of features: global, local and fusion (global + local).
+        此版本基于融合网络提取特征，并分别评估全局、局部（拼接后）以及融合特征。
         """
         self.set_model_mode('eval')
         targets = list(self.test_loader.keys())

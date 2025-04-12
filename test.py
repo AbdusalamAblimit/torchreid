@@ -14,7 +14,7 @@ datamanager = torchreid.data.ImageDataManager(
 
 
 model = torchreid.models.build_model(
-    name="osnetmod_ain_x1_0",
+    name="osnetmod_ain_x0_25",
     num_classes=datamanager.num_train_pids,
     loss="triplet",
     pretrained=True
@@ -43,7 +43,7 @@ engine = torchreid.engine.ImageTripletEnginePose(
 )
 
 engine.run(
-    save_dir="log/osnetmod_ain_x1_0",
+    save_dir="log/osnetmod_ain_x0_25_part",
     max_epoch=120,
     eval_freq=10,
     print_freq=10,
