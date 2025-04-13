@@ -199,30 +199,32 @@ class ImageTripletEnginePose(Engine):
         imgs = data['img']
         pids = data['pid']
         heatmaps = data['heatmap']
-        return imgs, pids, heatmaps
+        visibility= data["visibility"]
+        return imgs, pids, heatmaps,visibility
 
     def forward_backward(self, data):
         # 提取图像、pid 和热图
-        imgs, pids, heatmaps = self.parse_data_for_train(data)
+        imgs, pids, heatmaps,visibility = self.parse_data_for_train(data)
         if self.use_gpu:
             imgs = imgs.cuda()
             pids = pids.cuda()
             heatmaps = heatmaps.float().cuda()
+            visibility=visibility.float().cuda()
 
         # 模型前向传播，传入图像和热图，返回：
         #   x_global: 全局特征 (B, feature_dim)
         #   x_local: 局部特征列表，每个元素形状 (B, feature_dim)，共17个
         #   global_logits, local_logits: 对应分类器输出，用于交叉熵损失
-        x_global, x_local, global_logits, local_logits = self.model(imgs, heatmaps)
+        x_global, x_local, global_logits, local_logits = self.model(imgs, heatmaps,visibility)
         # 将17个局部特征拼接为 (B, 17 * feature_dim)
-        x_local_concat = torch.cat(x_local, dim=1)
+        # x_local_concat = torch.cat(x_local, dim=1)
 
         loss = 0
         loss_summary = {}
 
         # Triplet loss 部分
         if self.weight_t > 0:
-            loss_t_local = self.compute_loss(self.criterion_t, x_local_concat, pids)
+            loss_t_local = self.compute_loss(self.criterion_t, x_local, pids)
             loss += self.weight_t * loss_t_local
             loss_summary['loss_t_local'] = loss_t_local.item()
 
@@ -256,7 +258,8 @@ class ImageTripletEnginePose(Engine):
         pids = data['pid']
         camids = data['camid']
         heatmaps = data['heatmap']
-        return imgs, pids, camids, heatmaps
+        visibility = data["visibility"]
+        return imgs, pids, camids, heatmaps, visibility
 
     @torch.no_grad()
     def _evaluate(
@@ -280,22 +283,23 @@ class ImageTripletEnginePose(Engine):
             global_features, local_features, fusion_features = [], [], []
             pids_, camids_ = [], []
             for batch_idx, data in enumerate(data_loader):
-                imgs, pids, camids, heatmaps = self.parse_data_for_eval(data)
+                imgs, pids, camids, heatmaps,visibility = self.parse_data_for_eval(data)
                 if self.use_gpu:
                     imgs = imgs.cuda()
                     heatmaps = heatmaps.float().cuda()
+                    visibility = visibility.float().cuda()
                 end = time.time()
                 # 测试时模型只返回全局特征和局部特征列表
-                x_global, x_local = self.model(imgs, heatmaps)
+                x_global, x_local = self.model(imgs, heatmaps,visibility)
                 batch_time.update(time.time() - end)
                 # 将局部特征列表拼接为一个张量
-                x_local_concat = torch.cat(x_local, dim=1)
+                # x_local_concat = torch.cat(x_local, dim=1)
                 # 融合特征为全局与局部拼接后并归一化
-                fusion_feat = torch.cat([x_global, x_local_concat], dim=1)
+                fusion_feat = torch.cat([x_global, x_local], dim=1)
                 fusion_feat = F.normalize(fusion_feat, p=2, dim=1)
                 
                 global_features.append(x_global.cpu())
-                local_features.append(x_local_concat.cpu())
+                local_features.append(x_local.cpu())
                 fusion_features.append(fusion_feat.cpu())
 
                 pids_.extend(pids.tolist())

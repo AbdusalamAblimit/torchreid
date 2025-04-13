@@ -763,7 +763,7 @@ class OSNet_Modified(nn.Module):
             for _ in range(self.num_parts)
         ])
         # 定义局部分类器：先拼接 17 个局部特征（[B, 17*feature_dim]），再计算分类 logits
-        self.local_classifier = nn.Linear(self.num_parts * feature_dim, num_classes)
+        self.local_classifier = nn.Linear(feature_dim, num_classes)
 
         self._init_params()
 
@@ -809,11 +809,12 @@ class OSNet_Modified(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, heatmap, return_featuremaps=False):
+    def forward(self, x, heatmap, visibility, return_featuremaps=False):
         """
         x: 输入图像，尺寸 (B,3,256,128)
         heatmap: 关键点热图，尺寸 (B,17,64,32)
-        return_featuremaps 可用于调试（默认为 False）
+        visibility: 可见性信息，尺寸 (B,17,1) 或 (B,17)，表示每个关键点的置信度
+        return_featuremaps: 如果 True，则返回 feature maps 供调试使用（默认为 False）
         """
         # ------ 前处理 ------
         x = self.conv1(x)       # (B,64,128,64)
@@ -821,7 +822,7 @@ class OSNet_Modified(nn.Module):
         x = self.conv2(x)       # (B,256,64,32)
         
         # ------ 全局分支 ------
-        x_global = self.global_subnet(x)   # (B, channels[3],1,1)
+        x_global = self.global_subnet(x)   # (B,channels[3],1,1)
         x_global = x_global.view(x_global.size(0), -1)
         x_global = self.global_fc(x_global)  # (B, feature_dim)
         global_logits = self.global_classifier(x_global)
@@ -829,19 +830,45 @@ class OSNet_Modified(nn.Module):
         # ------ 局部分支 ------
         # 将 heatmap 按通道分割为 17 个 (B,1,64,32)
         heatmap_channels = torch.split(heatmap, 1, dim=1)
-        local_features = []
+        local_feats = []
         for i in range(self.num_parts):
-            feat_local = self.local_subnets[i](x, heatmap_channels[i])
-            local_features.append(feat_local)
-        # 训练时拼接局部特征计算分类 logits
-        concat_local = torch.cat(local_features, dim=1)  # (B, 17*feature_dim)
-        local_logits = self.local_classifier(concat_local)
+            feat_local = self.local_subnets[i](x, heatmap_channels[i])  # 输出形状 (B, feature_dim)
+            local_feats.append(feat_local)
+        # 堆叠得到 (B,17,feature_dim)
+        local_feats_tensor = torch.stack(local_feats, dim=1)  # shape: (B, 17, feature_dim)
+        
+        # 调整 visibility 的形状：若为 (B,17,1) 则 squeeze 成 (B,17)
+        if visibility.dim() == 3:
+            visibility = visibility.squeeze(-1)
+        
+        # 针对每个样本，根据阈值筛选局部特征
+        threshold = 0.3
+        batch_size = local_feats_tensor.size(0)
+        aggregated_local_list = []
+        for b in range(batch_size):
+            vis_b = visibility[b]            # shape: (17,)
+            feats_b = local_feats_tensor[b]    # shape: (17, feature_dim)
+            # 找到置信度大于阈值的索引
+            valid_idx = (vis_b > threshold).nonzero(as_tuple=False).squeeze()
+            if valid_idx.numel() >= 3:
+                selected_feats = feats_b[valid_idx]
+            else:
+                # 如果不足 3 个，则取置信度最高的 3 个索引
+                sorted_vis, sorted_idx = torch.sort(vis_b, descending=True)
+                top3_idx = sorted_idx[:3]
+                selected_feats = feats_b[top3_idx]
+            # 简单地均值聚合（当前各向量权重均为 1.0）
+            aggregated_feat = selected_feats.mean(dim=0)  # shape: (feature_dim,)
+            aggregated_local_list.append(aggregated_feat)
+        aggregated_local = torch.stack(aggregated_local_list, dim=0)  # shape: (B, feature_dim)
+        
+        # 根据新的 aggregated_local 计算局部分类 logits
+        local_logits = self.local_classifier(aggregated_local)
         
         if self.training:
-            return x_global, local_features, global_logits, local_logits
+            return x_global, aggregated_local, global_logits, local_logits
         else:
-            # 测试时直接返回全局与局部特征（局部特征以列表形式输出）
-            return x_global, local_features
+            return x_global, aggregated_local
 
 ############################################
 # 初始化预训练权重（修改后的版本）

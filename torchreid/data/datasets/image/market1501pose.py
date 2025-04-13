@@ -108,14 +108,29 @@ class Market1501Pose(ImageDataset):
             data.append((img_path, pid, camid, dsetid, pose_path, heatmap_path))
         return data
 
+
+
+    def get_visibility(self, pose, thresh=0.5):
+        """
+        根据传入的 pose 数据（形状为 (17, 3)，最后一维为置信度），
+        返回一个可见性向量，形状为 (17, 1)。
+        对于每个关键点，如果置信度大于阈值，则认为可见（1），否则不可见（0）。
+        """
+        # 取出最后一列的置信度
+        confidence = pose[:, 2]
+        # 二值化：大于阈值的记为 1，否则 0
+        visibility = (confidence > thresh).astype(np.float32)
+        # 可将形状调整为 (17, 1) ，也可以直接返回 (17,)
+        return visibility.reshape((17, 1))
+    
     def __getitem__(self, index):
         """返回样本数据
-
-        除了原始图像、pid、camid、impath 和 dsetid 外，还加载对应的关键点和热图数据。
+        除了原始图像、pid、camid、impath 和 dsetid 外，还加载对应的关键点、热图，
+        以及根据关键点计算得到的可见性。
         """
         img_path, pid, camid, dsetid, pose_path, heatmap_path = self.data[index]
-        img=read_image(img_path)
-        # 加载关键点数据（例如，一个 dict 或数组，取决于处理时的保存格式）
+        img = read_image(img_path)
+        # 加载关键点数据（例如，一个 numpy 数组，形状 (17,3)）
         with open(pose_path, 'rb') as f:
             pose = pickle.load(f)
         # 加载热图数据
@@ -124,12 +139,14 @@ class Market1501Pose(ImageDataset):
         # heatmap 原始尺寸为 (17, 64, 48)，dtype 很可能是 float16
         new_heatmap = np.zeros((heatmap.shape[0], heatmap.shape[1], 32), dtype=heatmap.dtype)
         for i in range(heatmap.shape[0]):
-            # 转换为 float32 再 resize，目标尺寸为 (width, height) = (32, 64)
+            # 转换为 float32 再 resize，目标尺寸为 (width=32, height=heatmap.shape[1])
             resized = cv2.resize(heatmap[i].astype(np.float32), (32, heatmap.shape[1]), interpolation=cv2.INTER_LINEAR)
             new_heatmap[i] = resized.astype(heatmap.dtype)
         heatmap = new_heatmap
         if self.transform is not None:
             img = self._transform_image(self.transform, self.k_tfm, img)
+        # 根据 pose 得到可见性信息
+        visibility = self.get_visibility(pose)
         item = {
             'img': img,
             'pid': pid,
@@ -138,5 +155,6 @@ class Market1501Pose(ImageDataset):
             'dsetid': dsetid,
             'pose': pose,
             'heatmap': heatmap,
+            'visibility': visibility,
         }
         return item

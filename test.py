@@ -43,7 +43,7 @@ engine = torchreid.engine.ImageTripletEnginePose(
 )
 
 engine.run(
-    save_dir="log/osnetmod_ain_x0_25_part",
+    save_dir="log/osnetmod_ain_x0_25_part_vis",
     max_epoch=120,
     eval_freq=10,
     print_freq=10,
