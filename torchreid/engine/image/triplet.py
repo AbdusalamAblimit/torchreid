@@ -219,13 +219,13 @@ class ImageTripletEnginePose(Engine):
         # 将17个局部特征拼接为 (B, 17 * feature_dim)
         # x_local_concat = torch.cat(x_local, dim=1)
 
-        loss = 0
+        loss = 0.0
         loss_summary = {}
 
         # Triplet loss 部分
         if self.weight_t > 0:
             loss_t_local = self.compute_loss(self.criterion_t, x_local, pids)
-            loss += self.weight_t * loss_t_local
+            loss += 3.0 * self.weight_t * loss_t_local
             loss_summary['loss_t_local'] = loss_t_local.item()
 
             loss_t_global = self.compute_loss(self.criterion_t, x_global, pids)
@@ -240,7 +240,7 @@ class ImageTripletEnginePose(Engine):
             loss_summary['acc_global'] = metrics.accuracy(global_logits, pids)[0].item()
 
             loss_x_local = self.compute_loss(self.criterion_x, local_logits, pids)
-            loss += self.weight_x * loss_x_local
+            loss += 3.0 * self.weight_x * loss_x_local
             loss_summary['loss_x_local'] = loss_x_local.item()
             loss_summary['acc_local'] = metrics.accuracy(local_logits, pids)[0].item()
 

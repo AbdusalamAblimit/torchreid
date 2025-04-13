@@ -621,112 +621,26 @@ class Conv1x1(nn.Module):
         x = self.bn(x)
         return self.relu(x)
 
-###############################################
-# 定义局部子网络，用于处理单一关键点分支
-###############################################
-class LocalSubnet(nn.Module):
-    def __init__(self, blocks, layers, channels, feature_dim=512, dropout_p=None):
-        """
-        blocks: 包含各阶段 block 构造函数的列表（例如 OSNet 使用的 block 列表）
-        layers: 原始 OSNet 配置中各阶段的层数（用于与 blocks 长度保持一致，本例中可忽略）
-        channels: 如 [64, 256, 384, 512]，对应 conv1, conv2, conv3, conv4/conv5 等通道数
-        feature_dim: 输出局部特征的维度，通常设置为 512
-        """
-        super(LocalSubnet, self).__init__()
-        # 先将单通道热图经 1×1 卷积扩充到 conv2 输出通道数（例如 256）
-        self.heatmap_conv = nn.Sequential(
-            nn.Conv2d(1, channels[1], kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels[1]),
-            nn.ReLU(inplace=True)
-        )
-        # 后续结构与全局分支类似
-        self.pool2 = nn.Sequential(
-            Conv1x1(channels[1], channels[1]),
-            nn.AvgPool2d(2, stride=2)  # 下采样: (B,256,64,32) -> (B,256,32,16)
-        )
-        # 注意此处 _make_layer 改为只传入 blocks 列表、in_channels 及 out_channels
-        self.conv3 = self._make_layer(blocks[1], channels[1], channels[2])
-        self.pool3 = nn.Sequential(
-            Conv1x1(channels[2], channels[2]),
-            nn.AvgPool2d(2, stride=2)  # 下采样: (B,384,32,16) -> (B,384,16,8)
-        )
-        self.conv4 = self._make_layer(blocks[2], channels[2], channels[3])
-        self.conv5 = Conv1x1(channels[3], channels[3])
-        self.avgpool = nn.AdaptiveAvgPool2d(1)  # 输出尺寸 (B, channels[3], 1, 1)
-        self.fc = self._construct_fc_layer(feature_dim, channels[3], dropout_p=dropout_p)
-        self._init_local_params()
-
-    def _make_layer(self, blocks, in_channels, out_channels):
-        # 与原始 OSNet 中的实现一致：
-        layers = []
-        layers.append(blocks[0](in_channels, out_channels))
-        for i in range(1, len(blocks)):
-            layers.append(blocks[i](out_channels, out_channels))
-        return nn.Sequential(*layers)
-
-    def _construct_fc_layer(self, fc_dim, input_dim, dropout_p=None):
-        if fc_dim is None or fc_dim < 0:
-            return None
-        fc_layers = []
-        fc_layers.append(nn.Linear(input_dim, fc_dim))
-        fc_layers.append(nn.BatchNorm1d(fc_dim))
-        fc_layers.append(nn.ReLU(inplace=True))
-        if dropout_p is not None:
-            fc_layers.append(nn.Dropout(p=dropout_p))
-        return nn.Sequential(*fc_layers)
-
-    def _init_local_params(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, x, heatmap_channel):
-        """
-        x: conv2 输出，形状 (B,256,64,32)
-        heatmap_channel: 单个部位热图，形状 (B,1,64,32)
-        """
-        # 将单通道热图经过 1×1 卷积扩充为 (B,256,64,32)
-        h = self.heatmap_conv(heatmap_channel)
-        # 与 conv2 输出逐元素相乘
-        x_fused = x * h  
-        x_fused = self.pool2(x_fused)
-        x_fused = self.conv3(x_fused)
-        x_fused = self.pool3(x_fused)
-        x_fused = self.conv4(x_fused)
-        x_fused = self.conv5(x_fused)
-        x_fused = self.avgpool(x_fused)   # (B, channels[3], 1, 1)
-        x_fused = x_fused.view(x_fused.size(0), -1)  # 展平为 (B, channels[3])
-        x_feat = self.fc(x_fused)  # (B, feature_dim)
-        return x_feat
-
-#########################################
-# 修改后的 OSNet 模型，包含全局和 17 个局部分支
-#########################################
 class OSNet_Modified(nn.Module):
-    def __init__(self, num_classes, blocks, layers, channels, feature_dim=512, loss='softmax', conv1_IN=False, dropout_p=None, **kwargs):
+    def __init__(self, num_classes, blocks, layers, channels, feature_dim=512,
+                 loss='softmax', conv1_IN=False, dropout_p=None, **kwargs):
         """
         num_classes: 分类数
-        blocks, layers, channels: 根据 OSNet 配置，例如 channels = [64, 256, 384, 512]
+        blocks, layers, channels: 根据 OSNet 配置，例如 channels=[64, 256, 384, 512]
         feature_dim: 全局与局部特征最终维度（例如 512）
         loss: 损失类型（例如 softmax）
-        conv1_IN: 控制 conv1 是否使用 InstanceNorm
-        dropout_p: FC层是否使用 dropout
+        conv1_IN: 是否使用 InstanceNorm
+        dropout_p: 全连接层 dropout 概率
         """
         super(OSNet_Modified, self).__init__()
         self.loss = loss
         self.feature_dim = feature_dim
         self.num_parts = 17  # 关键点数量
+
         # 前处理部分，输入图像尺寸 (B,3,256,128)
         self.conv1 = ConvLayer(3, channels[0], 7, stride=2, padding=3, IN=conv1_IN)
         self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
-        # 中间特征提取（分支分裂前）：conv2 将通道数扩展到 256，输出 (B,256,64,32)
+        # 中间特征提取（分支分裂前）：conv2 输出 (B,256,64,32)
         self.conv2 = self._make_layer(blocks[0], channels[0], channels[1])
         
         # -----------------
@@ -734,16 +648,16 @@ class OSNet_Modified(nn.Module):
         # -----------------
         self.pool2 = nn.Sequential(
             Conv1x1(channels[1], channels[1]),
-            nn.AvgPool2d(2, stride=2)  # (B,256,64,32) -> (B,256,32,16)
+            nn.AvgPool2d(2, stride=2)
         )
         self.conv3 = self._make_layer(blocks[1], channels[1], channels[2])
         self.pool3 = nn.Sequential(
             Conv1x1(channels[2], channels[2]),
-            nn.AvgPool2d(2, stride=2)  # (B,384,32,16) -> (B,384,16,8)
+            nn.AvgPool2d(2, stride=2)
         )
         self.conv4 = self._make_layer(blocks[2], channels[2], channels[3])
         self.conv5 = Conv1x1(channels[3], channels[3])
-        self.global_avgpool = nn.AdaptiveAvgPool2d(1)  # 输出 (B, channels[3],1,1)
+        self.global_avgpool = nn.AdaptiveAvgPool2d(1)
         self.global_fc = self._construct_fc_layer(feature_dim, channels[3], dropout_p=dropout_p)
         self.global_subnet = nn.Sequential(
             self.pool2,
@@ -756,19 +670,28 @@ class OSNet_Modified(nn.Module):
         self.global_classifier = nn.Linear(feature_dim, num_classes)
         
         # -----------------
-        # 局部分支：独立的 17 个局部子网络
+        # 局部分支：共享后续网络
+        # 在本设计中，我们不使用 17 个独立分支，而是先对所有部位的特征图进行加权融合，
+        # 再通过共享网络提取最终局部特征向量。
         # -----------------
-        self.local_subnets = nn.ModuleList([
-            LocalSubnet(blocks, layers, channels, feature_dim, dropout_p=dropout_p)
-            for _ in range(self.num_parts)
-        ])
-        # 定义局部分类器：先拼接 17 个局部特征（[B, 17*feature_dim]），再计算分类 logits
+        # 定义局部共享网络，该网络处理聚合后的局部 feature map（形状 (B,256,64,32)）
+        self.local_shared_net = nn.Sequential(
+            # 模仿 global 分支结构，但输入通道为 channels[1] (256)
+            Conv1x1(channels[1], channels[1]),
+            nn.AvgPool2d(2, stride=2),                    # (B,256,32,16)
+            self._make_layer(blocks[1], channels[1], channels[2]),  # (B,384,32,16)
+            nn.AvgPool2d(2, stride=2),                    # (B,384,16,8)
+            self._make_layer(blocks[2], channels[2], channels[3]),  # (B,512,16,8)
+            Conv1x1(channels[3], channels[3]),
+            nn.AdaptiveAvgPool2d(1)                       # (B,512,1,1)
+        )
+        self.local_fc = self._construct_fc_layer(feature_dim, channels[3], dropout_p=dropout_p)
+        # 局部分类器接受最终局部特征向量 (B, feature_dim)
         self.local_classifier = nn.Linear(feature_dim, num_classes)
 
         self._init_params()
 
     def _make_layer(self, blocks, in_channels, out_channels):
-        # 与原始 OSNet 的 _make_layer 类似：遍历 blocks 列表构建层
         layers_list = []
         layers_list.append(blocks[0](in_channels, out_channels))
         for i in range(1, len(blocks)):
@@ -779,11 +702,7 @@ class OSNet_Modified(nn.Module):
         if fc_dim is None or fc_dim < 0:
             self.feature_dim = input_dim
             return None
-        if isinstance(fc_dim, int):
-            fc_dims = [fc_dim]
-        else:
-            fc_dims = fc_dim
-
+        fc_dims = [fc_dim] if isinstance(fc_dim, int) else fc_dim
         layers = []
         for dim in fc_dims:
             layers.append(nn.Linear(input_dim, dim))
@@ -814,55 +733,62 @@ class OSNet_Modified(nn.Module):
         x: 输入图像，尺寸 (B,3,256,128)
         heatmap: 关键点热图，尺寸 (B,17,64,32)
         visibility: 可见性信息，尺寸 (B,17,1) 或 (B,17)，表示每个关键点的置信度
-        return_featuremaps: 如果 True，则返回 feature maps 供调试使用（默认为 False）
+        return_featuremaps: 如果 True，则返回 feature maps 用于调试（默认为 False）
         """
         # ------ 前处理 ------
-        x = self.conv1(x)       # (B,64,128,64)
-        x = self.maxpool(x)     # (B,64,64,32)
-        x = self.conv2(x)       # (B,256,64,32)
+        x = self.conv1(x)        # (B,64,128,64)
+        x = self.maxpool(x)      # (B,64,64,32)
+        x = self.conv2(x)        # (B,256,64,32)
         
         # ------ 全局分支 ------
-        x_global = self.global_subnet(x)   # (B,channels[3],1,1)
+        x_global = self.global_subnet(x)      # (B,channels[3],1,1)
         x_global = x_global.view(x_global.size(0), -1)
-        x_global = self.global_fc(x_global)  # (B, feature_dim)
+        x_global = self.global_fc(x_global)     # (B, feature_dim)
         global_logits = self.global_classifier(x_global)
         
-        # ------ 局部分支 ------
-        # 将 heatmap 按通道分割为 17 个 (B,1,64,32)
+        # ------ 局部分支：利用可见性加权融合各部位的 feature map ------
+        # 将 heatmap 按通道分割为 17 个，得到 17 个 heatmap_channel，每个形状 (B,1,64,32)
         heatmap_channels = torch.split(heatmap, 1, dim=1)
-        local_feats = []
+        fused_list = []
         for i in range(self.num_parts):
-            feat_local = self.local_subnets[i](x, heatmap_channels[i])  # 输出形状 (B, feature_dim)
-            local_feats.append(feat_local)
-        # 堆叠得到 (B,17,feature_dim)
-        local_feats_tensor = torch.stack(local_feats, dim=1)  # shape: (B, 17, feature_dim)
+            # 对于每个部位：先使用 1x1 conv 处理 heatmap_i（这里复用局部分支中的 heatmap_conv 不再独立调用 LocalSubnet）
+            # 这里为了保持简单，可以直接用点乘，也可先对热图做 1x1 卷积（此处不额外定义，假设热图本身已归一化）
+            fused = x * heatmap_channels[i]  # (B,256,64,32)
+            fused_list.append(fused)
+        # 堆叠得到 shape: (B,17,256,64,32)
+        fused_tensor = torch.stack(fused_list, dim=1)
         
         # 调整 visibility 的形状：若为 (B,17,1) 则 squeeze 成 (B,17)
         if visibility.dim() == 3:
             visibility = visibility.squeeze(-1)
         
-        # 针对每个样本，根据阈值筛选局部特征
+        # 针对每个样本，根据可见性信息聚合部位 feature map：
+        # 如果可见部位数量 >= 3，则按可见度加权求和后归一化；
+        # 否则，选取可见度最高的 3 个部位进行加权平均。
         threshold = 0.3
-        batch_size = local_feats_tensor.size(0)
-        aggregated_local_list = []
+        batch_size = fused_tensor.size(0)
+        eps = 1e-6
+        aggregated_feature_list = []
         for b in range(batch_size):
-            vis_b = visibility[b]            # shape: (17,)
-            feats_b = local_feats_tensor[b]    # shape: (17, feature_dim)
-            # 找到置信度大于阈值的索引
-            valid_idx = (vis_b > threshold).nonzero(as_tuple=False).squeeze()
-            if valid_idx.numel() >= 3:
-                selected_feats = feats_b[valid_idx]
+            vis_b = visibility[b]         # (17,)
+            fused_b = fused_tensor[b]       # (17,256,64,32)
+            if vis_b.sum() >= 3:
+                # 按照每个部位的可见性加权求和
+                vis_weight = vis_b.view(-1, 1, 1, 1)  # (17,1,1,1)
+                aggregated = (fused_b * vis_weight).sum(dim=0) / (vis_b.sum() + eps)
             else:
-                # 如果不足 3 个，则取置信度最高的 3 个索引
+                # 否则，选取可见度最高的3个部位
                 sorted_vis, sorted_idx = torch.sort(vis_b, descending=True)
                 top3_idx = sorted_idx[:3]
-                selected_feats = feats_b[top3_idx]
-            # 简单地均值聚合（当前各向量权重均为 1.0）
-            aggregated_feat = selected_feats.mean(dim=0)  # shape: (feature_dim,)
-            aggregated_local_list.append(aggregated_feat)
-        aggregated_local = torch.stack(aggregated_local_list, dim=0)  # shape: (B, feature_dim)
+                vis_top = vis_b[top3_idx].view(-1, 1, 1, 1)  # (3,1,1,1)
+                aggregated = (fused_b[top3_idx] * vis_top).sum(dim=0) / (vis_b[top3_idx].sum() + eps)
+            aggregated_feature_list.append(aggregated)
+        aggregated_feature_map = torch.stack(aggregated_feature_list, dim=0)  # (B,256,64,32)
         
-        # 根据新的 aggregated_local 计算局部分类 logits
+        # 将聚合后的 feature map 送入共享的局部网络
+        local_feature_map = self.local_shared_net(aggregated_feature_map)  # (B,channels[3],1,1)
+        local_feature_map = local_feature_map.view(local_feature_map.size(0), -1)  # (B, channels[3])
+        aggregated_local = self.local_fc(local_feature_map)  # (B, feature_dim)
         local_logits = self.local_classifier(aggregated_local)
         
         if self.training:
