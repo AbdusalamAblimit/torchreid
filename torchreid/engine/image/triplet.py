@@ -5,6 +5,22 @@ from torchreid.losses import TripletLoss, CrossEntropyLoss
 
 from ..engine import Engine
 
+from PIL import ImageDraw, ImageFont
+from torchvision.utils import make_grid
+from torchvision import transforms
+def overlay_pid(pil_img, pid, position=(5,5), color="red", font_size=16):
+    """
+    在 PIL 图像上叠加 pid 信息
+    """
+    draw = ImageDraw.Draw(pil_img)
+    try:
+        # 尝试加载内置字体（或指定 TTF 字体路径）
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except IOError:
+        font = ImageFont.load_default()
+    text = f"PID: {pid}"
+    draw.text(position, text, fill=color, font=font)
+    return pil_img
 
 class ImageTripletEngine(Engine):
     r"""Triplet-loss engine for image-reid.
@@ -259,7 +275,8 @@ class ImageTripletEnginePose(Engine):
         camids = data['camid']
         heatmaps = data['heatmap']
         visibility = data["visibility"]
-        return imgs, pids, camids, heatmaps, visibility
+        img_path = data["img_path"]
+        return imgs, pids, camids, heatmaps, visibility,img_path
 
     @torch.no_grad()
     def _evaluate(
@@ -279,22 +296,21 @@ class ImageTripletEnginePose(Engine):
         self.set_model_mode('eval')
         batch_time = AverageMeter()
 
+        # 修改 _feature_extraction 同时返回 impath 列表
         def _feature_extraction(data_loader):
             global_features, local_features, fusion_features = [], [], []
-            pids_, camids_ = [], []
+            pids_, camids_, impaths = [], [], []
             for batch_idx, data in enumerate(data_loader):
-                imgs, pids, camids, heatmaps,visibility = self.parse_data_for_eval(data)
+                imgs, pids, camids, heatmaps, visibility, impath = self.parse_data_for_eval(data)
                 if self.use_gpu:
                     imgs = imgs.cuda()
                     heatmaps = heatmaps.float().cuda()
                     visibility = visibility.float().cuda()
                 end = time.time()
-                # 测试时模型只返回全局特征和局部特征列表
-                x_global, x_local = self.model(imgs, heatmaps,visibility)
+                # 测试时模型只返回全局特征和局部特征向量
+                x_global, x_local = self.model(imgs, heatmaps, visibility)
                 batch_time.update(time.time() - end)
-                # 将局部特征列表拼接为一个张量
-                # x_local_concat = torch.cat(x_local, dim=1)
-                # 融合特征为全局与局部拼接后并归一化
+                # 融合特征为全局与局部拼接后归一化
                 fusion_feat = torch.cat([x_global, x_local], dim=1)
                 fusion_feat = F.normalize(fusion_feat, p=2, dim=1)
                 
@@ -304,19 +320,19 @@ class ImageTripletEnginePose(Engine):
 
                 pids_.extend(pids.tolist())
                 camids_.extend(camids.tolist())
+                impaths.extend(impath)   # 将 impath 加入列表
             global_features = torch.cat(global_features, 0)
             local_features = torch.cat(local_features, 0)
             fusion_features = torch.cat(fusion_features, 0)
             pids_ = np.asarray(pids_)
             camids_ = np.asarray(camids_)
-            return global_features, local_features, fusion_features, pids_, camids_
+            return global_features, local_features, fusion_features, pids_, camids_, impaths
 
         print('Extracting features from query set ...')
-        q_global, q_local, q_fusion, q_pids, q_camids = _feature_extraction(query_loader)
+        q_global, q_local, q_fusion, q_pids, q_camids, q_impaths = _feature_extraction(query_loader)
         print('Done, obtained {}-by-{} matrix'.format(q_fusion.size(0), q_fusion.size(1)))
-
         print('Extracting features from gallery set ...')
-        g_global, g_local, g_fusion, g_pids, g_camids = _feature_extraction(gallery_loader)
+        g_global, g_local, g_fusion, g_pids, g_camids, g_impaths = _feature_extraction(gallery_loader)
         print('Done, obtained {}-by-{} matrix'.format(g_fusion.size(0), g_fusion.size(1)))
         print('Speed: {:.4f} sec/batch'.format(batch_time.avg))
 
@@ -344,24 +360,60 @@ class ImageTripletEnginePose(Engine):
             print('CMC curve')
             for r in ranks:
                 print('Rank-{:<3}: {:.1%}'.format(r, cmc[r - 1]))
-            return cmc[0], mAP
+            return cmc, mAP, distmat
 
-        # 分别评估全局特征、局部特征和拼接后的融合特征
-        print('Evaluating global features ...')
-        rank1_global, mAP_global = evaluate_features(q_global, g_global, 'Global')
-
-        print('Evaluating local features ...')
-        rank1_local, mAP_local = evaluate_features(q_local, g_local, 'Local')
-
+        # 以融合特征作为示例进行 error vis
         print('Evaluating concatenated features ...')
-        rank1_fusion, mAP_fusion = evaluate_features(q_fusion, g_fusion, 'Fusion')
+        cmc_fusion, mAP_fusion, distmat = evaluate_features(q_fusion, g_fusion, 'Fusion')
+        rank1_fusion = cmc_fusion[0]
+
+        # 统计查询中 rank-1 错误的样本，并构造可视化结果（query 与 top-5 gallery）
+        # 假设我们有自定义的函数 load_image(impath) 返回 PIL image，和 torchvision.transforms.ToTensor() 用于 tensorboard 显示
+        from torchvision.utils import make_grid
+        from torchvision import transforms
+        to_tensor = transforms.ToTensor()
+        from torchreid.utils.tools import read_image as  load_image
+        vis_images = []  # 用于 tensorboard 输出
+
+        # 对于每个查询样本，计算排序索引
+        distmat_np = distmat.cpu().numpy()  # (num_query, num_gallery)
+        sorted_indices = np.argsort(distmat_np, axis=1)  # 每行从小到大
+        for i in range(len(q_impaths)):
+            query_pid = q_pids[i]
+            ranked_gallery = sorted_indices[i]
+            top1_gallery_pid = g_pids[ranked_gallery[0]]
+            if top1_gallery_pid != query_pid:
+                # 加载 query 图像并在上面绘制 pid
+                query_img = load_image(q_impaths[i])  # 返回 PIL Image
+                query_img = overlay_pid(query_img, query_pid, position=(5,5), color="red", font_size=16)
+                # 加载 top 5 的 gallery 图像，并在上面标记相应的 pid
+                gallery_imgs = []
+                for j in ranked_gallery[:5]:
+                    g_img = load_image(g_impaths[j])
+                    g_img = overlay_pid(g_img, g_pids[j], position=(5,5), color="red", font_size=16)
+                    gallery_imgs.append(g_img)
+                # 组合 query 与 gallery 图像
+                images_to_cat = [to_tensor(query_img)] + [to_tensor(img) for img in gallery_imgs]
+                vis_grid = make_grid(images_to_cat, nrow=len(images_to_cat), padding=2)
+                vis_images.append(vis_grid)
+
+        # 将所有 error vis 图片拼接为一个大 grid 后输出到 tensorboard
+        if len(vis_images) > 0 and self.writer is not None:
+            error_grid = make_grid(torch.stack(vis_images), nrow=1)
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            self.writer.add_image(f'Error_Rank1_vs_Rank1-5', error_grid, self.epoch)
+
+        # 此处也可以对 global、local 分别评估...
+        # 例如：
+        # cmc_global, mAP_global, _ = evaluate_features(q_global, g_global, 'Global')
+        # cmc_local, mAP_local, _ = evaluate_features(q_local, g_local, 'Local')
 
         return {
-            'global': {'rank1': rank1_global, 'mAP': mAP_global},
-            'local': {'rank1': rank1_local, 'mAP': mAP_local},
+            # 'global': {'rank1': cmc_global[0], 'mAP': mAP_global},
+            # 'local': {'rank1': cmc_local[0], 'mAP': mAP_local},
             'fusion': {'rank1': rank1_fusion, 'mAP': mAP_fusion}
         }
-    
+
     def test(
         self,
         dist_metric='euclidean',
@@ -374,8 +426,8 @@ class ImageTripletEnginePose(Engine):
         rerank=False
     ):
         r"""Tests model on target datasets.
-
-        此版本基于融合网络提取特征，并分别评估全局、局部（拼接后）以及融合特征。
+        此版本基于融合网络提取特征，并分别评估全局、局部（融合后的）以及拼接特征。
+        同时，对于查询中 Rank-1 错误的样本，将 query 与 rank-1-5 的 gallery 图像拼接后输出到 TensorBoard。
         """
         self.set_model_mode('eval')
         targets = list(self.test_loader.keys())
@@ -387,7 +439,6 @@ class ImageTripletEnginePose(Engine):
             query_loader = self.test_loader[name]['query']
             gallery_loader = self.test_loader[name]['gallery']
 
-            # _evaluate 返回一个字典，包含 'global', 'local' 和 'fusion' 三种特征的评估结果
             metrics_dict = self._evaluate(
                 dataset_name=name,
                 query_loader=query_loader,

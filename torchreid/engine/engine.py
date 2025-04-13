@@ -164,7 +164,8 @@ class Engine(object):
             raise ValueError(
                 'visrank can be set to True only if test_only=True'
             )
-
+        if self.writer is None:
+            self.writer = SummaryWriter(log_dir=save_dir)
         if test_only:
             self.test(
                 dist_metric=dist_metric,
@@ -176,10 +177,10 @@ class Engine(object):
                 ranks=ranks,
                 rerank=rerank
             )
+            self.writer.close ()
             return
 
-        if self.writer is None:
-            self.writer = SummaryWriter(log_dir=save_dir)
+
 
         time_start = time.time()
         self.start_epoch = start_epoch

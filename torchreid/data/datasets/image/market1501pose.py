@@ -156,5 +156,6 @@ class Market1501Pose(ImageDataset):
             'pose': pose,
             'heatmap': heatmap,
             'visibility': visibility,
+            'img_path': img_path
         }
         return item
