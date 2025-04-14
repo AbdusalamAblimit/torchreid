@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from torchreid import metrics
 from torchreid.utils import (
-    MetricMeter, AverageMeter, re_ranking, open_all_layers, save_checkpoint,
+    MetricMeter, AverageMeter, re_ranking, open_all_layers, save_checkpoint,load_checkpoint,
     open_specified_layers, visualize_ranked_results
 )
 from torchreid.losses import DeepSupervision
@@ -87,6 +87,43 @@ class Engine(object):
                 osp.join(save_dir, name),
                 is_best=is_best
             )
+
+    def load_model(self, ckpt_path, strict=True):
+        """
+        从指定目录 load_dir 中加载模型、优化器和调度器状态，并返回加载的 epoch 和 rank1。
+        
+        Args:
+            load_dir (str): 保存 checkpoint 的目录，通常 save_model 时各模型状态保存路径为 osp.join(load_dir, name)
+            strict (bool): 是否严格加载状态字典，默认为 True。
+            
+        Returns:
+            epoch (int): 加载的 epoch 数（例如 checkpoint['epoch']）
+            rank1 (float): 加载的 rank1 值（例如 checkpoint['rank1']）
+        """
+        names = self.get_model_names()
+        loaded_epoch = None
+        loaded_rank1 = None
+        for name in names:
+            # 构造 checkpoint 文件路径，假设保存路径为 osp.join(load_dir, name)
+            # ckpt_path = osp.join(load_dir, name)
+            print(f"Loading checkpoint from {ckpt_path}...")
+            # load_checkpoint 为你已有的辅助函数，返回 checkpoint 字典
+            checkpoint = load_checkpoint(ckpt_path)
+            # 加载模型状态字典
+            self._models[name].load_state_dict(checkpoint['state_dict'], strict=strict)
+            # 加载对应优化器状态
+            if 'optimizer' in checkpoint and self._optims.get(name, None) is not None:
+                self._optims[name].load_state_dict(checkpoint['optimizer'])
+            # 加载调度器状态
+            if 'scheduler' in checkpoint and self._scheds.get(name, None) is not None:
+                self._scheds[name].load_state_dict(checkpoint['scheduler'])
+            # 获取 epoch 和 rank1（假设各模块保存的值一致）
+            loaded_epoch = checkpoint.get('epoch', None)
+            loaded_rank1 = checkpoint.get('rank1', None)
+            print(f"Loaded {name}: epoch = {loaded_epoch}, rank1 = {loaded_rank1}")
+        return loaded_epoch, loaded_rank1
+
+
 
     def set_model_mode(self, mode='train', names=None):
         assert mode in ['train', 'eval', 'test']

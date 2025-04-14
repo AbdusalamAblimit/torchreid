@@ -626,7 +626,7 @@ class OSNet_Modified(nn.Module):
                  loss='softmax', conv1_IN=False, dropout_p=None, **kwargs):
         """
         num_classes: 分类数
-        blocks, layers, channels: 根据 OSNet 配置，例如 channels=[64, 256, 384, 512]
+        blocks, layers, channels: 根据 OSNet 配置，例如 channels = [64, 256, 384, 512]
         feature_dim: 全局与局部特征最终维度（例如 512）
         loss: 损失类型（例如 softmax）
         conv1_IN: 是否使用 InstanceNorm
@@ -640,7 +640,7 @@ class OSNet_Modified(nn.Module):
         # 前处理部分，输入图像尺寸 (B,3,256,128)
         self.conv1 = ConvLayer(3, channels[0], 7, stride=2, padding=3, IN=conv1_IN)
         self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
-        # 中间特征提取（分支分裂前）：conv2 输出 (B,256,64,32)
+        # conv2：输出 (B,256,64,32)
         self.conv2 = self._make_layer(blocks[0], channels[0], channels[1])
         
         # -----------------
@@ -670,23 +670,28 @@ class OSNet_Modified(nn.Module):
         self.global_classifier = nn.Linear(feature_dim, num_classes)
         
         # -----------------
-        # 局部分支：共享后续网络
-        # 在本设计中，我们不使用 17 个独立分支，而是先对所有部位的特征图进行加权融合，
-        # 再通过共享网络提取最终局部特征向量。
+        # 局部分支：新的设计
+        # 我们利用 heatmap 与可见性对 conv2 输出进行融合，
+        # 然后用一个 1x1 卷积（local_heatmap_conv）将 17 通道的 heatmap 转换为 256 通道，
+        # 最后与基础特征做加法，再通过共享网络 local_branch 提取最终局部特征。
         # -----------------
-        # 定义局部共享网络，该网络处理聚合后的局部 feature map（形状 (B,256,64,32)）
-        self.local_shared_net = nn.Sequential(
-            # 模仿 global 分支结构，但输入通道为 channels[1] (256)
+        # 用于对原始 heatmap（17通道）进行 1x1 卷积，映射到 channels[1]=256 通道
+        self.local_heatmap_conv = nn.Sequential(
+            nn.Conv2d(17, channels[1], kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels[1]),
+            nn.ReLU(inplace=True)
+        )
+        # 共享局部分支，结构可仿照全局分支后半部分，但输入为 (B,256,64,32)
+        self.local_branch = nn.Sequential(
             Conv1x1(channels[1], channels[1]),
-            nn.AvgPool2d(2, stride=2),                    # (B,256,32,16)
-            self._make_layer(blocks[1], channels[1], channels[2]),  # (B,384,32,16)
-            nn.AvgPool2d(2, stride=2),                    # (B,384,16,8)
-            self._make_layer(blocks[2], channels[2], channels[3]),  # (B,512,16,8)
+            nn.AvgPool2d(2, stride=2),                                # (B,256,32,16)
+            self._make_layer(blocks[1], channels[1], channels[2]),     # (B,384,32,16)
+            nn.AvgPool2d(2, stride=2),                                # (B,384,16,8)
+            self._make_layer(blocks[2], channels[2], channels[3]),     # (B,512,16,8)
             Conv1x1(channels[3], channels[3]),
-            nn.AdaptiveAvgPool2d(1)                       # (B,512,1,1)
+            nn.AdaptiveAvgPool2d(1)                                   # (B,512,1,1)
         )
         self.local_fc = self._construct_fc_layer(feature_dim, channels[3], dropout_p=dropout_p)
-        # 局部分类器接受最终局部特征向量 (B, feature_dim)
         self.local_classifier = nn.Linear(feature_dim, num_classes)
 
         self._init_params()
@@ -736,9 +741,9 @@ class OSNet_Modified(nn.Module):
         return_featuremaps: 如果 True，则返回 feature maps 用于调试（默认为 False）
         """
         # ------ 前处理 ------
-        x = self.conv1(x)        # (B,64,128,64)
-        x = self.maxpool(x)      # (B,64,64,32)
-        x = self.conv2(x)        # (B,256,64,32)
+        x = self.conv1(x)          # (B,64,128,64)
+        x = self.maxpool(x)        # (B,64,64,32)
+        x = self.conv2(x)          # (B,256,64,32)
         
         # ------ 全局分支 ------
         x_global = self.global_subnet(x)      # (B,channels[3],1,1)
@@ -746,49 +751,20 @@ class OSNet_Modified(nn.Module):
         x_global = self.global_fc(x_global)     # (B, feature_dim)
         global_logits = self.global_classifier(x_global)
         
-        # ------ 局部分支：利用可见性加权融合各部位的 feature map ------
-        # 将 heatmap 按通道分割为 17 个，得到 17 个 heatmap_channel，每个形状 (B,1,64,32)
-        heatmap_channels = torch.split(heatmap, 1, dim=1)
-        fused_list = []
-        for i in range(self.num_parts):
-            # 对于每个部位：先使用 1x1 conv 处理 heatmap_i（这里复用局部分支中的 heatmap_conv 不再独立调用 LocalSubnet）
-            # 这里为了保持简单，可以直接用点乘，也可先对热图做 1x1 卷积（此处不额外定义，假设热图本身已归一化）
-            fused = x * heatmap_channels[i]  # (B,256,64,32)
-            fused_list.append(fused)
-        # 堆叠得到 shape: (B,17,256,64,32)
-        fused_tensor = torch.stack(fused_list, dim=1)
-        
-        # 调整 visibility 的形状：若为 (B,17,1) 则 squeeze 成 (B,17)
+        # ------ 局部分支（新设计）------
+        # 处理 heatmap 与可见性：先将每个 heatmap 通道乘上对应的可见性
         if visibility.dim() == 3:
-            visibility = visibility.squeeze(-1)
-        
-        # 针对每个样本，根据可见性信息聚合部位 feature map：
-        # 如果可见部位数量 >= 3，则按可见度加权求和后归一化；
-        # 否则，选取可见度最高的 3 个部位进行加权平均。
-        threshold = 0.3
-        batch_size = fused_tensor.size(0)
-        eps = 1e-6
-        aggregated_feature_list = []
-        for b in range(batch_size):
-            vis_b = visibility[b]         # (17,)
-            fused_b = fused_tensor[b]       # (17,256,64,32)
-            if vis_b.sum() >= 3:
-                # 按照每个部位的可见性加权求和
-                vis_weight = vis_b.view(-1, 1, 1, 1)  # (17,1,1,1)
-                aggregated = (fused_b * vis_weight).sum(dim=0) / (vis_b.sum() + eps)
-            else:
-                # 否则，选取可见度最高的3个部位
-                sorted_vis, sorted_idx = torch.sort(vis_b, descending=True)
-                top3_idx = sorted_idx[:3]
-                vis_top = vis_b[top3_idx].view(-1, 1, 1, 1)  # (3,1,1,1)
-                aggregated = (fused_b[top3_idx] * vis_top).sum(dim=0) / (vis_b[top3_idx].sum() + eps)
-            aggregated_feature_list.append(aggregated)
-        aggregated_feature_map = torch.stack(aggregated_feature_list, dim=0)  # (B,256,64,32)
-        
-        # 将聚合后的 feature map 送入共享的局部网络
-        local_feature_map = self.local_shared_net(aggregated_feature_map)  # (B,channels[3],1,1)
+            visibility = visibility.squeeze(-1)    # (B,17)
+        vis = visibility.view(visibility.size(0), visibility.size(1), 1, 1)  # (B,17,1,1)
+        new_heatmap = heatmap  # * vis            # (B,17,64,32)
+        # 通过 1×1 卷积将 17 通道映射为 256 通道
+        new_heatmap_proj = self.local_heatmap_conv(new_heatmap)  # (B,256,64,32)
+        # 与基础特征 x 相加融合
+        local_fused = x * new_heatmap_proj     # (B,256,64,32)
+        # 输入共享局部分支网络，提取局部特征
+        local_feature_map = self.local_branch(local_fused)  # (B,channels[3],1,1)
         local_feature_map = local_feature_map.view(local_feature_map.size(0), -1)  # (B, channels[3])
-        aggregated_local = self.local_fc(local_feature_map)  # (B, feature_dim)
+        aggregated_local = self.local_fc(local_feature_map)   # (B, feature_dim)
         local_logits = self.local_classifier(aggregated_local)
         
         if self.training:
@@ -802,13 +778,16 @@ class OSNet_Modified(nn.Module):
 def init_pretrained_weights_mod(model, key=''):
     """
     初始化 OSNet_Modified 模型的预训练权重：
-      1. 优先加载与预训练权重键名直接匹配的层（全局分支和共享部分）。
-      2. 对于局部子网络中的层（位于 local_subnets 模块中），若去掉局部前缀后与全局分支中对应的层匹配，
-         则复制其权重。
-    注意：局部子网络中独有的层（例如 heatmap_conv）由于没有全局对应结构，不进行初始化。
+      1. 优先加载与预训练权重键名直接匹配的层（主要包括全局分支和公共层）。
+      2. 对于局部分支中部分模块（如 local_fc 和 local_classifier），若在全局分支中有对应模块，
+         则将全局权重复制到局部分支中，以利用预训练知识。
+    注意：
+      - 对于新设计中没有全局对应关系的模块（例如 local_heatmap_conv、local_branch），
+        将不进行权重复制，而使用随机初始化（或者你可额外设置其他初始化方案）。
     """
     import os, errno, gdown, warnings
     from collections import OrderedDict
+
     torch_home = os.path.expanduser(
         os.getenv('TORCH_HOME', os.path.join(os.getenv('XDG_CACHE_HOME', '~/.cache'), 'torch'))
     )
@@ -818,15 +797,19 @@ def init_pretrained_weights_mod(model, key=''):
     except OSError as e:
         if e.errno != errno.EEXIST:
             raise
+
     filename = key + '_imagenet.pth'
     cached_file = os.path.join(model_dir, filename)
     if not os.path.exists(cached_file):
         gdown.download(pretrained_urls[key], cached_file, quiet=False)
+
     state_dict = torch.load(cached_file)
     model_dict = model.state_dict()
     new_state_dict = OrderedDict()
-    matched_layers, discarded_layers = [], []
-    # 第一轮：直接匹配全局分支及共享部分
+    matched_layers = []
+    discarded_layers = []
+
+    # 第一轮：直接匹配（主要针对全局分支和共享部分）
     for k, v in state_dict.items():
         if k.startswith('module.'):
             k = k[7:]
@@ -835,42 +818,41 @@ def init_pretrained_weights_mod(model, key=''):
             matched_layers.append(k)
         else:
             discarded_layers.append(k)
-    # 第二轮：针对局部子网络，从全局分支复制对应权重
+
+    # 第二轮：对于新局部模块中的部分进行权重复制
+    # 例如：将 local_fc 初始化为 global_fc 的权重，
+    #        将 local_classifier 初始化为 global_classifier 的权重
     mapping = {
-        'pool2': 'pool2',
-        'conv3': 'conv3',
-        'pool3': 'pool3',
-        'conv4': 'conv4',
-        'conv5': 'conv5',
-        'fc': 'global_fc'
+        'local_fc': 'global_fc',
+        'local_classifier': 'global_classifier'
     }
-    for k in model_dict.keys():
-        if k.startswith('local_subnets.'):
-            parts = k.split('.')
-            if len(parts) < 3:
-                continue
-            sub_layer = parts[2]
-            if sub_layer not in mapping:
-                continue
-            global_key = mapping[sub_layer]
-            if len(parts) > 3:
-                global_key = global_key + '.' + '.'.join(parts[3:])
-            if global_key in new_state_dict and new_state_dict[global_key].size() == model_dict[k].size():
-                new_state_dict[k] = new_state_dict[global_key].clone()
-                matched_layers.append(k)
-            elif global_key in state_dict and state_dict[global_key].size() == model_dict[k].size():
-                new_state_dict[k] = state_dict[global_key]
-                matched_layers.append(k)
-            else:
-                discarded_layers.append(k)
+    for local_prefix, global_prefix in mapping.items():
+        for k, v in model_dict.items():
+            if k.startswith(local_prefix):
+                # 构造对应的全局 key：替换 local_prefix 为 global_prefix
+                global_key = k.replace(local_prefix, global_prefix, 1)
+                if global_key in new_state_dict and new_state_dict[global_key].size() == v.size():
+                    new_state_dict[k] = new_state_dict[global_key].clone()
+                    matched_layers.append(k)
+                elif global_key in state_dict and state_dict[global_key].size() == v.size():
+                    new_state_dict[k] = state_dict[global_key]
+                    matched_layers.append(k)
+                else:
+                    discarded_layers.append(k)
+
     model_dict.update(new_state_dict)
     model.load_state_dict(model_dict)
+
     if len(matched_layers) == 0:
-        warnings.warn('The pretrained weights from "{}" cannot be loaded, please check the key names manually (** ignored and continue **)'.format(cached_file))
+        warnings.warn(
+            'The pretrained weights from "{}" cannot be loaded, please check the key names manually '
+            '(** ignored and continue **).'.format(cached_file)
+        )
     else:
         print('Successfully loaded imagenet pretrained weights from "{}"'.format(cached_file))
         if len(discarded_layers) > 0:
-            print('** The following layers are discarded due to unmatched keys or layer size: {}'.format(discarded_layers))
+            print('** The following layers are discarded due to unmatched keys or layer size: {}'
+                  .format(discarded_layers))
 
 def osnetmod_ain_x1_0(
     num_classes=1000, pretrained=True, loss='softmax', **kwargs

@@ -41,10 +41,10 @@ engine = torchreid.engine.ImageTripletEnginePose(
     scheduler=scheduler,
     label_smooth=True
 )
-
+engine.load_model("log/osnetmod_ain_x1_0_part_vis_0414/model/model.pth.tar-30")
 engine.run(
-    save_dir="log/osnetmod_ain_x1_0_part_vis_0414_old_mulonly",
+    save_dir="log/osnetmod_ain_x1_0_part_vis_0414_vis_test",
     max_epoch=120,
     eval_freq=10,
     print_freq=10,
-    test_only=False)
+    test_only=True)

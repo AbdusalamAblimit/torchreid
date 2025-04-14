@@ -354,7 +354,8 @@ class ImageTripletEnginePose(Engine):
                 distmat_gg = metrics.compute_distance_matrix(gf, gf, dist_metric)
                 distmat = re_ranking(distmat, distmat_qq, distmat_gg)
             print('Computing CMC and mAP for {} features ...'.format(name))
-            cmc, mAP = metrics.evaluate_rank(distmat, q_pids, g_pids, q_camids, g_camids, use_metric_cuhk03=use_metric_cuhk03)
+            cmc, mAP = metrics.evaluate_rank(distmat, q_pids, g_pids, q_camids, g_camids,
+                                            use_metric_cuhk03=use_metric_cuhk03)
             print('** {} Results **'.format(name))
             print('mAP: {:.1%}'.format(mAP))
             print('CMC curve')
@@ -362,58 +363,83 @@ class ImageTripletEnginePose(Engine):
                 print('Rank-{:<3}: {:.1%}'.format(r, cmc[r - 1]))
             return cmc, mAP, distmat
 
-        # 以融合特征作为示例进行 error vis
-        print('Evaluating concatenated features ...')
-        cmc_fusion, mAP_fusion, distmat = evaluate_features(q_fusion, g_fusion, 'Fusion')
+        # 以融合特征作为示例进行 error vis（可视化错误样本）
+        print('Evaluating fused features ...')
+        cmc_fusion, mAP_fusion, distmat_fusion = evaluate_features(q_fusion, g_fusion, 'Fusion')
         rank1_fusion = cmc_fusion[0]
 
-        # 统计查询中 rank-1 错误的样本，并构造可视化结果（query 与 top-5 gallery）
-        # 假设我们有自定义的函数 load_image(impath) 返回 PIL image，和 torchvision.transforms.ToTensor() 用于 tensorboard 显示
+        # 错误样例可视化辅助函数
+        from PIL import ImageDraw, ImageFont
+        def overlay_pid(pil_img, pid, position=(5, 5), color="red", font_size=16):
+            draw = ImageDraw.Draw(pil_img)
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except IOError:
+                font = ImageFont.load_default()
+            draw.text(position, f"PID: {pid}", fill=color, font=font)
+            return pil_img
+
         from torchvision.utils import make_grid
         from torchvision import transforms
         to_tensor = transforms.ToTensor()
-        from torchreid.utils.tools import read_image as  load_image
-        vis_images = []  # 用于 tensorboard 输出
+        from torchreid.utils.tools import read_image as load_image
+        vis_images_fusion = []  # 存储融合特征错误样例
 
-        # 对于每个查询样本，计算排序索引
-        distmat_np = distmat.cpu().numpy()  # (num_query, num_gallery)
-        sorted_indices = np.argsort(distmat_np, axis=1)  # 每行从小到大
+        distmat_np_fusion = distmat_fusion.cpu().numpy()
+        sorted_indices_fusion = np.argsort(distmat_np_fusion, axis=1)
         for i in range(len(q_impaths)):
             query_pid = q_pids[i]
-            ranked_gallery = sorted_indices[i]
+            ranked_gallery = sorted_indices_fusion[i]
             top1_gallery_pid = g_pids[ranked_gallery[0]]
             if top1_gallery_pid != query_pid:
-                # 加载 query 图像并在上面绘制 pid
-                query_img = load_image(q_impaths[i])  # 返回 PIL Image
+                query_img = load_image(q_impaths[i])
                 query_img = overlay_pid(query_img, query_pid, position=(5,5), color="red", font_size=16)
-                # 加载 top 5 的 gallery 图像，并在上面标记相应的 pid
                 gallery_imgs = []
                 for j in ranked_gallery[:5]:
                     g_img = load_image(g_impaths[j])
                     g_img = overlay_pid(g_img, g_pids[j], position=(5,5), color="red", font_size=16)
                     gallery_imgs.append(g_img)
-                # 组合 query 与 gallery 图像
                 images_to_cat = [to_tensor(query_img)] + [to_tensor(img) for img in gallery_imgs]
                 vis_grid = make_grid(images_to_cat, nrow=len(images_to_cat), padding=2)
-                vis_images.append(vis_grid)
+                vis_images_fusion.append(vis_grid)
+        if len(vis_images_fusion) > 0 and self.writer is not None:
+            error_grid_fusion = make_grid(torch.stack(vis_images_fusion), nrow=1)
+            self.writer.add_image(f'Error_Fusion_Rank1_vs_Rank1-5', error_grid_fusion, self.epoch)
 
-        # 将所有 error vis 图片拼接为一个大 grid 后输出到 tensorboard
-        if len(vis_images) > 0 and self.writer is not None:
-            error_grid = make_grid(torch.stack(vis_images), nrow=1)
-            print("!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            self.writer.add_image(f'Error_Rank1_vs_Rank1-5', error_grid, self.epoch)
+        # 接下来，对局部特征也进行错误样例可视化
+        print('Evaluating local features ...')
+        cmc_local, mAP_local, distmat_local = evaluate_features(q_local, g_local, 'Local')
+        rank1_local = cmc_local[0]
+        vis_images_local = []
+        distmat_np_local = distmat_local.cpu().numpy()
+        sorted_indices_local = np.argsort(distmat_np_local, axis=1)
+        for i in range(len(q_impaths)):
+            query_pid = q_pids[i]
+            ranked_gallery = sorted_indices_local[i]
+            top1_gallery_pid = g_pids[ranked_gallery[0]]
+            if top1_gallery_pid != query_pid:
+                query_img = load_image(q_impaths[i])
+                query_img = overlay_pid(query_img, query_pid, position=(5,5), color="blue", font_size=16)
+                gallery_imgs = []
+                for j in ranked_gallery[:5]:
+                    g_img = load_image(g_impaths[j])
+                    g_img = overlay_pid(g_img, g_pids[j], position=(5,5), color="blue", font_size=16)
+                    gallery_imgs.append(g_img)
+                images_to_cat = [to_tensor(query_img)] + [to_tensor(img) for img in gallery_imgs]
+                vis_grid = make_grid(images_to_cat, nrow=len(images_to_cat), padding=2)
+                vis_images_local.append(vis_grid)
+        if len(vis_images_local) > 0 and self.writer is not None:
+            error_grid_local = make_grid(torch.stack(vis_images_local), nrow=1)
+            self.writer.add_image(f'Error_Local_Rank1_vs_Rank1-5', error_grid_local, self.epoch)
 
-        # 此处也可以对 global、local 分别评估...
-        # 例如：
-        # cmc_global, mAP_global, _ = evaluate_features(q_global, g_global, 'Global')
-        # cmc_local, mAP_local, _ = evaluate_features(q_local, g_local, 'Local')
+        # 也可分别评估 global 特征（此处保留）
+        cmc_global, mAP_global, _ = evaluate_features(q_global, g_global, 'Global')
 
         return {
-            # 'global': {'rank1': cmc_global[0], 'mAP': mAP_global},
-            # 'local': {'rank1': cmc_local[0], 'mAP': mAP_local},
+            'global': {'rank1': cmc_global[0], 'mAP': mAP_global},
+            'local': {'rank1': rank1_local, 'mAP': mAP_local},
             'fusion': {'rank1': rank1_fusion, 'mAP': mAP_fusion}
         }
-
     def test(
         self,
         dist_metric='euclidean',
